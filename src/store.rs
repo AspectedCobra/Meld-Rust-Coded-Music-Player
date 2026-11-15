@@ -66,6 +66,8 @@ pub struct Settings {
     pub cover: String,
     pub crossfade: f64,
     pub offline: bool,
+    pub window: String, // mica | acrylic | clear | solid
+    pub opacity: u8,    // how see-through the panels are (0 = clear glass, 255 = solid)
     #[serde(skip)]
     path: PathBuf,
 }
@@ -74,7 +76,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             eq: Eq::default(), loudness: false, theme: "blue".into(), cover: "blue".into(),
-            crossfade: 0.0, offline: false, path: PathBuf::new(),
+            crossfade: 0.0, offline: false, window: "mica".into(), opacity: 90, path: PathBuf::new(),
         }
     }
 }
@@ -91,6 +93,9 @@ impl Settings {
         }
         if !COVER_MODES.contains(&s.cover.as_str()) {
             s.cover = "blue".into();
+        }
+        if !["mica", "acrylic", "clear", "solid"].contains(&s.window.as_str()) {
+            s.window = "mica".into();
         }
         if !CROSSFADES.contains(&s.crossfade) {
             s.crossfade = 0.0;
