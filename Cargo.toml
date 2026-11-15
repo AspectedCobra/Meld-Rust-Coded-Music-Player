@@ -17,6 +17,7 @@ lofty = "0.22"
 global-hotkey = "0.6"
 souvlaki = "0.7"
 raw-window-handle = "0.6"
+window-vibrancy = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
