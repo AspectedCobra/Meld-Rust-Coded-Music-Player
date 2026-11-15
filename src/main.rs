@@ -1,4 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod audio;
 mod cover;
 mod mix;
@@ -24,10 +25,11 @@ use ytm::{LState, Lyrics};
 
 const BG: Color32 = Color32::BLACK;
 const WHITE: Color32 = Color32::from_rgb(232, 232, 232);
-const DIM: Color32 = Color32::from_rgb(122, 122, 122);
-const BORDER: Color32 = Color32::from_rgb(46, 46, 46);
-const HOVER_BG: Color32 = Color32::from_rgb(20, 20, 20);
-const TRACK: Color32 = Color32::from_rgb(38, 38, 38);
+const DIM: Color32 = Color32::from_rgb(150, 150, 158);
+const BORDER: Color32 = Color32::from_rgba_premultiplied(34, 34, 34, 34); // white at 13%
+const HOVER_BG: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+const TRACK: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 40);
+const WINDOW_MODES: [&str; 4] = ["mica", "acrylic", "clear", "solid"];
 const ROW: f32 = 24.0;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -177,6 +179,7 @@ struct App {
     smtc: Option<MediaControls>,
     smtc_key: (Option<String>, u8),
     smtc_last: Instant,
+    hwnd: Option<isize>,
 }
 
 fn accent_rgb(theme: &str) -> [u8; 3] {
@@ -184,26 +187,69 @@ fn accent_rgb(theme: &str) -> [u8; 3] {
 }
 fn rgb(c: [u8; 3]) -> Color32 { Color32::from_rgb(c[0], c[1], c[2]) }
 
+fn tint(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
 fn apply_visuals(ctx: &egui::Context, acc: Color32) {
     let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = BG;
-    v.extreme_bg_color = BG;
-    v.faint_bg_color = BG;
-    v.selection.bg_fill = acc;
-    v.selection.stroke = Stroke::new(1.0, BG);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, WHITE);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    v.panel_fill = Color32::TRANSPARENT;
+    v.window_fill = Color32::from_rgb(24, 24, 30);
+    v.extreme_bg_color = Color32::from_black_alpha(90);
+    v.faint_bg_color = Color32::TRANSPARENT;
+    v.selection.bg_fill = tint(acc, 120);
+    v.selection.stroke = Stroke::new(1.0_f32, WHITE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, WHITE);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+        w.rounding = egui::Rounding::same(6.0);
+    }
     v.widgets.inactive.bg_fill = TRACK;
     v.widgets.inactive.weak_bg_fill = TRACK;
     v.widgets.hovered.bg_fill = acc;
+    v.widgets.hovered.weak_bg_fill = tint(acc, 90);
     v.widgets.active.bg_fill = acc;
     ctx.set_visuals(v);
 }
 
+/// Windows 11 'glass' behind the window: Mica (blurred wallpaper) or Acrylic (blurred desktop).
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const [i32; 4]) -> i32;
+}
+
+struct Hwnd(isize);
+impl raw_window_handle::HasWindowHandle for Hwnd {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let h = raw_window_handle::Win32WindowHandle::new(std::num::NonZeroIsize::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?);
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(h)) })
+    }
+}
+
+fn apply_backdrop(hwnd: Option<isize>, mode: &str) {
+    let Some(h) = hwnd else { return };
+    let w = Hwnd(h);
+    let _ = window_vibrancy::clear_acrylic(&w);
+    let _ = window_vibrancy::clear_mica(&w);
+    match mode {
+        "mica" => {
+            unsafe { DwmExtendFrameIntoClientArea(h, &[-1, -1, -1, -1]); }
+            let _ = window_vibrancy::apply_mica(&w, Some(true));
+        }
+        "acrylic" => {
+            let _ = window_vibrancy::apply_acrylic(&w, Some((10, 10, 16, 90)));
+        }
+        _ => {}
+    }
+}
+
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    // Windows system fonts as fallback for Japanese, Chinese, Korean and symbols
+    // Segoe UI (the Windows 11 look), then system fonts as fallback for Japanese, Chinese, Korean and symbols
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts.font_data.insert("segoeui".into(), egui::FontData::from_owned(bytes));
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "segoeui".into());
+    }
     for (name, file) in [("yugoth", "YuGothM.ttc"), ("msyh", "msyh.ttc"), ("malgun", "malgun.ttf"), ("segsym", "seguisym.ttf")] {
         if let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) {
             fonts.font_data.insert(name.into(), egui::FontData::from_owned(bytes));
@@ -215,36 +261,77 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
     for (_, f) in style.text_styles.iter_mut() {
-        f.family = egui::FontFamily::Monospace;
+        f.family = egui::FontFamily::Proportional;
     }
-    style.text_styles.insert(egui::TextStyle::Body, FontId::monospace(13.0));
-    style.text_styles.insert(egui::TextStyle::Button, FontId::monospace(13.0));
-    style.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(13.0));
-    style.text_styles.insert(egui::TextStyle::Small, FontId::monospace(12.0));
-    style.spacing.item_spacing = vec2(6.0, 2.0);
+    style.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.5));
+    style.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.5));
+    style.text_styles.insert(egui::TextStyle::Small, FontId::proportional(12.0));
+    style.spacing.item_spacing = vec2(6.0, 3.0);
     ctx.set_style(style);
 }
 
 // ------------------------------------------------------------- small widgets
-fn boxed() -> egui::Frame {
-    egui::Frame::none().fill(BG).stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(egui::Margin::same(6.0)).outer_margin(egui::Margin::symmetric(6.0, 2.0))
+/// A rounded glass card.
+fn boxed(fill: Color32) -> egui::Frame {
+    egui::Frame::none().fill(fill).stroke(Stroke::new(1.0_f32, BORDER)).rounding(12.0)
+        .inner_margin(egui::Margin::same(8.0)).outer_margin(egui::Margin::symmetric(6.0, 3.0))
 }
 
-/// A '[button]' in terminal style: coloured text, accent colour on hover. `bg` draws it as a filled bar.
+/// '[save]' -> 'save', '[x] thing' -> '● thing'
+fn strip_label(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("[x] ") { return format!("●  {rest}"); }
+    if let Some(rest) = text.strip_prefix("[ ] ") { return format!("○  {rest}"); }
+    if text.len() > 2 && text.starts_with('[') && text.ends_with(']') { return text[1..text.len() - 1].to_string(); }
+    text.to_string()
+}
+
+/// A flat button: coloured text, a soft rounded highlight on hover. `bg` draws it as a filled pill.
 fn tbtn2(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Option<Color32>, acc: Color32) -> egui::Response {
-    let font = FontId::monospace(13.0);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), fg);
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(6.0, 4.0), Sense::click());
+    let label = strip_label(text);
+    let font = FontId::proportional(13.5);
+    let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), fg);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(14.0, 6.0), Sense::click());
     if let Some(b) = bg {
-        ui.painter().rect_filled(rect, 0.0, b);
+        ui.painter().rect_filled(rect, 8.0, b);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 8.0, HOVER_BG);
     }
     let c = if bg.is_none() && resp.hovered() { acc } else { fg };
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, font, c);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, c);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 fn tbtn(ui: &mut egui::Ui, text: &str, fg: Color32, acc: Color32) -> egui::Response {
     tbtn2(ui, text, fg, None, acc)
+}
+
+/// A round icon button (transport controls). `big` = the filled play/pause circle.
+fn ibtn(ui: &mut egui::Ui, glyph: &str, acc: Color32, big: bool) -> egui::Response {
+    let size = if big { 32.0 } else { 28.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    let hov = resp.hovered();
+    let font = FontId::proportional(if big { 16.0 } else { 15.0 });
+    if big {
+        ui.painter().circle_filled(rect.center(), size / 2.0, if hov { acc } else { WHITE });
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, font, BG);
+    } else {
+        if hov { ui.painter().circle_filled(rect.center(), size / 2.0, HOVER_BG); }
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, font, if hov { acc } else { WHITE });
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Shorten text with '…' so it fits `max_w` pixels.
+fn fit(ui: &egui::Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let w = |s: &str| ui.fonts(|f| f.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x);
+    if w(text) <= max_w { return text.to_string(); }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let s: String = chars[..mid].iter().collect::<String>() + "…";
+        if w(&s) <= max_w { lo = mid } else { hi = mid - 1 }
+    }
+    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
 }
 
 fn ell(s: &str, max_chars: usize) -> String {
@@ -260,34 +347,36 @@ fn ell(s: &str, max_chars: usize) -> String {
 #[derive(PartialEq, Clone, Copy)]
 enum RowAct { None, Play, Right, Up, Remove }
 
-/// One song line: '01  title        artist     3:35'. The playing song is drawn in inverse
-/// video. actions: 0 none, 1 = [^] [x], 2 = [x].
+/// One song line: number, title, artist, length. The playing song gets an accent tint and a bar.
+/// actions: 0 none, 1 = up + remove, 2 = remove.
 fn track_row(ui: &mut egui::Ui, t: &Track, label: &str, playing: bool, actions: u8, acc: Color32) -> RowAct {
-    let font = FontId::monospace(13.0);
-    let cw = ui.fonts(|f| f.glyph_width(&font, '0'));
+    let font = FontId::proportional(13.5);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
     let p = ui.painter_at(rect);
+    let inner = rect.shrink2(vec2(0.0, 1.0));
     if playing {
-        p.rect_filled(rect, 0.0, acc);
+        p.rect_filled(inner, 8.0, tint(acc, 60));
+        p.rect_filled(Rect::from_min_size(pos2(inner.left() + 2.0, inner.center().y - 7.0), vec2(3.0, 14.0)), 1.5, acc);
     } else if resp.hovered() {
-        p.rect_filled(rect, 0.0, HOVER_BG);
+        p.rect_filled(inner, 8.0, HOVER_BG);
     }
-    let (main, dim) = if playing { (BG, BG) } else { (WHITE, DIM) };
+    let dim = if playing { Color32::from_rgb(205, 205, 212) } else { DIM };
     let cy = rect.center().y;
-    let right = match actions { 1 => 7.0 * cw + 20.0, 2 => 3.0 * cw + 20.0, _ => 0.0 };
-    let dur_x = rect.right() - 16.0 - right;
+    let right = match actions { 1 => 56.0, 2 => 28.0, _ => 0.0 };
+    let dur_x = rect.right() - 14.0 - right;
     let artist_w = (rect.width() * 0.28).max(120.0);
-    let artist_x = dur_x - 5.0 * cw - 20.0 - artist_w;
-    let title_x = rect.left() + 10.0 + 2.0 * cw + 18.0;
-    p.text(pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, label, font.clone(), dim);
-    p.text(pos2(title_x, cy), Align2::LEFT_CENTER, ell(&t.title, ((artist_x - title_x - 16.0) / cw) as usize), font.clone(), main);
-    p.text(pos2(artist_x, cy), Align2::LEFT_CENTER, ell(&t.artist, (artist_w / cw) as usize), font.clone(), dim);
+    let artist_x = dur_x - 44.0 - artist_w;
+    let num_x = rect.left() + 14.0;
+    let title_x = num_x + 30.0;
+    p.text(pos2(num_x, cy), Align2::LEFT_CENTER, label, font.clone(), dim);
+    p.text(pos2(title_x, cy), Align2::LEFT_CENTER, fit(&*ui, &t.title, &font, artist_x - title_x - 12.0), font.clone(), WHITE);
+    p.text(pos2(artist_x, cy), Align2::LEFT_CENTER, fit(&*ui, &t.artist, &font, artist_w), font.clone(), dim);
     p.text(pos2(dur_x, cy), Align2::RIGHT_CENTER, fmt(t.duration as f64), font.clone(), dim);
     if actions > 0 {
-        let xr = rect.right() - 16.0;
-        p.text(pos2(xr, cy), Align2::RIGHT_CENTER, "[x]", font.clone(), dim);
+        let xr = rect.right() - 14.0;
+        p.text(pos2(xr, cy), Align2::RIGHT_CENTER, "✕", font.clone(), dim);
         if actions == 1 {
-            p.text(pos2(xr - 4.0 * cw, cy), Align2::RIGHT_CENTER, "[^]", font.clone(), dim);
+            p.text(pos2(xr - 28.0, cy), Align2::RIGHT_CENTER, "↑", font.clone(), dim);
         }
     }
     if resp.secondary_clicked() {
@@ -296,8 +385,8 @@ fn track_row(ui: &mut egui::Ui, t: &Track, label: &str, playing: bool, actions: 
     if resp.clicked() {
         let x = resp.interact_pointer_pos().map(|p| p.x).unwrap_or(0.0);
         if actions > 0 {
-            if x >= rect.right() - 16.0 - 3.0 * cw - 4.0 { return RowAct::Remove; }
-            if actions == 1 && x >= rect.right() - 16.0 - 7.0 * cw - 4.0 { return RowAct::Up; }
+            if x >= rect.right() - 14.0 - 24.0 { return RowAct::Remove; }
+            if actions == 1 && x >= rect.right() - 14.0 - 52.0 { return RowAct::Up; }
         }
         return RowAct::Play;
     }
@@ -306,10 +395,10 @@ fn track_row(ui: &mut egui::Ui, t: &Track, label: &str, playing: bool, actions: 
 
 /// A clickable line with text on the left and dim text on the right.
 fn line_row(ui: &mut egui::Ui, left: &str, right: &str) -> bool {
-    let font = FontId::monospace(13.0);
+    let font = FontId::proportional(13.5);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+        ui.painter().rect_filled(rect, 8.0, HOVER_BG);
     }
     ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, left, font.clone(), WHITE);
     ui.painter().text(pos2(rect.right() - 16.0, rect.center().y), Align2::RIGHT_CENTER, right, font, DIM);
@@ -317,13 +406,13 @@ fn line_row(ui: &mut egui::Ui, left: &str, right: &str) -> bool {
 }
 
 fn bar_row(ui: &mut egui::Ui, name: &str, frac: f32, value: &str, acc: Color32) {
-    let font = FontId::monospace(13.0);
+    let font = FontId::proportional(13.5);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
     let p = ui.painter();
     let cy = rect.center().y;
     p.text(pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, ell(name, 24), font.clone(), WHITE);
     let x0 = rect.left() + rect.width() * 0.45;
-    p.rect_filled(Rect::from_min_size(pos2(x0, cy - 4.0), vec2(200.0 * frac.clamp(0.0, 1.0), 8.0)), 0.0, acc);
+    p.rect_filled(Rect::from_min_size(pos2(x0, cy - 4.0), vec2(200.0 * frac.clamp(0.0, 1.0), 8.0)), 4.0, acc);
     p.text(pos2(rect.right() - 16.0, cy), Align2::RIGHT_CENTER, value, font, DIM);
 }
 
@@ -390,8 +479,16 @@ impl App {
         let theme_applied = settings.theme.clone();
         let (hotkeys, media_ids) = setup_media_keys();
         let smtc = setup_smtc(cc, bus.tx.clone(), cc.egui_ctx.clone());
+        let hwnd = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match cc.window_handle().ok().map(|h| h.as_raw()) {
+                Some(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
+                _ => None,
+            }
+        };
+        apply_backdrop(hwnd, &settings.window);
         App {
-            _hotkeys: hotkeys, media_ids, smtc, smtc_key: (None, 0), smtc_last: Instant::now(),
+            _hotkeys: hotkeys, media_ids, smtc, smtc_key: (None, 0), smtc_last: Instant::now(), hwnd,
             bus, rx, player, tmpdir,
             lufs: Arc::new(Loudness::load(&home.join("loudness.json"))),
             taste: Taste::load(&home.join("taste.json")),
@@ -416,6 +513,15 @@ impl App {
     }
 
     fn accent(&self) -> Color32 { rgb(accent_rgb(&self.settings.theme)) }
+    /// Fill of the glass cards: see-through by the opacity setting, solid in 'solid' mode.
+    fn glass(&self) -> Color32 {
+        if self.settings.window == "solid" { Color32::from_rgb(10, 10, 14) } else { Color32::from_rgba_unmultiplied(14, 14, 20, self.settings.opacity) }
+    }
+    fn set_window_mode(&mut self, mode: &str) {
+        self.settings.window = mode.into();
+        self.settings.save();
+        apply_backdrop(self.hwnd, mode);
+    }
     fn offline(&self) -> bool { self.settings.offline || !self.online }
     fn flash(&mut self, text: impl Into<String>, secs: f32) {
         self.flash = (text.into(), Instant::now() + Duration::from_secs_f32(secs));
@@ -1154,12 +1260,13 @@ impl App {
 impl App {
     fn ui(&mut self, ctx: &egui::Context) {
         let acc = self.accent();
-        egui::TopBottomPanel::top("search").frame(boxed()).show(ctx, |ui| {
+        let fill = self.glass();
+        egui::TopBottomPanel::top("search").frame(boxed(fill)).show(ctx, |ui| {
             self.search_bar(ui, acc);
             self.tab_bar(ui, acc);
         });
-        egui::TopBottomPanel::bottom("player").frame(boxed()).show(ctx, |ui| self.now_playing(ui, acc));
-        egui::CentralPanel::default().frame(boxed()).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("player").frame(boxed(fill)).show(ctx, |ui| self.now_playing(ui, acc));
+        egui::CentralPanel::default().frame(boxed(fill)).show(ctx, |ui| {
             match self.view {
                 View::Results | View::Queue | View::Library => self.draw_tracks(ui, acc),
                 View::Lyrics => self.draw_lyrics(ui, acc),
@@ -1177,7 +1284,7 @@ impl App {
             for (i, (v, label)) in TABS.iter().enumerate() {
                 if i == 4 || i == 7 { sep(ui); } // groups: browse | yours | tune
                 let text = format!(" {label} ");
-                let r = if self.view == *v { tbtn2(ui, &text, BG, Some(acc), acc) } else { tbtn(ui, &text, DIM, acc) };
+                let r = if self.view == *v { tbtn2(ui, &text, WHITE, Some(tint(acc, 90)), acc) } else { tbtn(ui, &text, DIM, acc) };
                 if r.clicked() { self.set_view(*v); }
             }
         });
@@ -1192,10 +1299,11 @@ impl App {
 
     fn search_bar(&mut self, ui: &mut egui::Ui, acc: Color32) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(">").color(acc).strong());
-            let w = (ui.available_width() - 260.0).max(100.0);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search).id(self.search_id).frame(false).desired_width(w)
-                .hint_text(RichText::new("search songs   ( / to focus, esc to leave )").color(DIM)));
+            let w = (ui.available_width() - 270.0).max(100.0);
+            let r = egui::Frame::none().fill(TRACK).rounding(10.0).inner_margin(egui::Margin::symmetric(10.0, 3.0)).show(ui, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.search).id(self.search_id).frame(false).desired_width(w)
+                    .hint_text(RichText::new("Search songs    ( / to focus )").color(DIM)))
+            }).inner;
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { self.do_search(); }
             if tbtn(ui, "[search]", WHITE, acc).clicked() { self.do_search(); }
             if tbtn(ui, "[random]", WHITE, acc).clicked() { self.play_random(); }
@@ -1261,21 +1369,21 @@ impl App {
         let cy = bar.center().y;
         let x = bar.left() + shown as f32 * bar.width();
         let p = ui.painter();
-        p.rect_filled(Rect::from_min_max(pos2(bar.left(), cy - 2.0), pos2(bar.right(), cy + 2.0)), 0.0, TRACK);
-        p.rect_filled(Rect::from_min_max(pos2(bar.left(), cy - 2.0), pos2(x, cy + 2.0)), 0.0, acc);
-        p.rect_filled(Rect::from_min_max(pos2(x - 2.5, cy - 7.0), pos2(x + 2.5, cy + 7.0)), 0.0, WHITE);
+        p.rect_filled(Rect::from_min_max(pos2(bar.left(), cy - 2.0), pos2(bar.right(), cy + 2.0)), 2.0, TRACK);
+        p.rect_filled(Rect::from_min_max(pos2(bar.left(), cy - 2.0), pos2(x, cy + 2.0)), 2.0, acc);
+        p.circle_filled(pos2(x, cy), 6.0, WHITE);
         let pos = shown * len;
-        let font = FontId::monospace(12.0);
+        let font = FontId::proportional(12.0);
         p.text(rect.left_center(), Align2::LEFT_CENTER, fmt(pos), font.clone(), DIM);
         p.text(rect.right_center(), Align2::RIGHT_CENTER, format!("-{}", fmt(len - pos)), font, DIM);
 
         // row 3: playback | this song | volume
         ui.horizontal(|ui| {
-            if tbtn(ui, "[prev]", WHITE, acc).clicked() { self.prev(); }
+            if ibtn(ui, "⏮", acc, false).clicked() { self.prev(); }
             let playing = self.has_track && matches!(self.state, PState::Playing) || self.busy;
-            if tbtn(ui, if playing { "[pause]" } else { "[play]" }, WHITE, acc).clicked() { self.toggle(); }
-            if tbtn(ui, "[next]", WHITE, acc).clicked() { self.next(); }
-            if tbtn(ui, "[stop]", WHITE, acc).clicked() { self.stop(); }
+            if ibtn(ui, if playing { "⏸" } else { "▶" }, acc, true).clicked() { self.toggle(); }
+            if ibtn(ui, "⏭", acc, false).clicked() { self.next(); }
+            if ibtn(ui, "⏹", acc, false).clicked() { self.stop(); }
             sep(ui);
             let first = track.as_ref().and_then(|t| split_artists(&t.artist).into_iter().next());
             let banned = first.as_ref().map(|a| self.taste.is_banned(a)).unwrap_or(false);
@@ -1593,6 +1701,18 @@ impl App {
                 self.settings.save();
                 self.flash(if i == 1 { "Offline mode: only saved songs" } else { "Offline mode off (automatic)" }, 3.0);
             }
+            let modes: Vec<(String, Option<Color32>)> = WINDOW_MODES.iter().map(|w| (w.to_string(), None)).collect();
+            let cur = WINDOW_MODES.iter().position(|w| *w == self.settings.window).unwrap_or(0);
+            if let Some(i) = opt_row(ui, "window", &modes, cur, acc, "# mica / acrylic = see-through glass (Windows 11)") { self.set_window_mode(WINDOW_MODES[i]); }
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 24.0], egui::Label::new(RichText::new("opacity").color(DIM)));
+                let mut o = self.settings.opacity as f32;
+                if ui.add(egui::Slider::new(&mut o, 0.0..=255.0).show_value(false)).changed() {
+                    self.settings.opacity = o as u8;
+                    self.eq_dirty = true; // saved when you let go of the slider
+                }
+                note(ui, "# lower = more see-through");
+            });
             ui.add_space(10.0);
             note(ui, "# keyboard (not while typing in the search box; esc leaves it)");
             let keys = [("space", "play / pause"), ("n  p", "next / previous"), ("left right", "seek 5 s (shift 30 s)"),
@@ -1627,6 +1747,10 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.settings.window == "solid" { [0.04, 0.04, 0.055, 1.0] } else { [0.0, 0.0, 0.0, 0.0] }
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.log_listen(false);
         if let Some(p) = self.player.as_mut() { p.stop(); }
@@ -1650,7 +1774,7 @@ fn main() -> eframe::Result<()> {
             std::env::set_var("PATH", joined);
         }
     }
-    let mut viewport = egui::ViewportBuilder::default().with_inner_size([900.0, 620.0]).with_min_inner_size([700.0, 480.0]).with_title("Meld");
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([900.0, 620.0]).with_min_inner_size([700.0, 480.0]).with_title("Meld").with_transparent(true);
     if let Ok(img) = image::load_from_memory(include_bytes!("../assets/icon.png")) {
         let img = img.to_rgba8();
         viewport = viewport.with_icon(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() });
