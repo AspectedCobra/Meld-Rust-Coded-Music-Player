@@ -95,7 +95,15 @@ enum Msg {
     Flash(String, f32),
     Saved(Track),
     Media(MediaKey),
+    DlDone { id: String, result: Result<PathBuf, String> },
 }
+
+/// One song in download mode: waiting for its file, saved, or failed.
+#[derive(Clone)]
+enum DlState { Working, Done(PathBuf), Failed(String) }
+
+#[derive(Clone, Copy, PartialEq)]
+enum DlAct { None, Download, Play }
 
 #[derive(Clone)]
 struct Bus { tx: Sender<Msg>, ctx: egui::Context }
@@ -180,6 +188,7 @@ struct App {
     smtc_key: (Option<String>, u8),
     smtc_last: Instant,
     hwnd: Option<isize>,
+    downloads: Vec<(Track, DlState)>,
 }
 
 fn accent_rgb(theme: &str) -> [u8; 3] {
@@ -416,6 +425,50 @@ fn bar_row(ui: &mut egui::Ui, name: &str, frac: f32, value: &str, acc: Color32) 
     p.text(pos2(rect.right() - 16.0, cy), Align2::RIGHT_CENTER, value, font, DIM);
 }
 
+/// A search result in download mode: number, title, artist, length, and its download state.
+fn dl_row(ui: &mut egui::Ui, t: &Track, k: usize, st: Option<&DlState>, acc: Color32) -> DlAct {
+    let font = FontId::proportional(13.5);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::click());
+    let p = ui.painter_at(rect);
+    if resp.hovered() { p.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 8.0, HOVER_BG); }
+    let cy = rect.center().y;
+    let dur_x = rect.right() - 14.0 - 190.0;
+    let artist_w = (rect.width() * 0.26).max(110.0);
+    let artist_x = dur_x - 44.0 - artist_w;
+    let num_x = rect.left() + 14.0;
+    let title_x = num_x + 30.0;
+    p.text(pos2(num_x, cy), Align2::LEFT_CENTER, format!("{:02}", k + 1), font.clone(), DIM);
+    p.text(pos2(title_x, cy), Align2::LEFT_CENTER, fit(&*ui, &t.title, &font, artist_x - title_x - 12.0), font.clone(), WHITE);
+    p.text(pos2(artist_x, cy), Align2::LEFT_CENTER, fit(&*ui, &t.artist, &font, artist_w), font.clone(), DIM);
+    p.text(pos2(dur_x, cy), Align2::RIGHT_CENTER, fmt(t.duration as f64), font.clone(), DIM);
+    let xr = rect.right() - 14.0;
+    let pill = Rect::from_min_size(pos2(xr - 68.0, cy - 10.0), vec2(68.0, 20.0));
+    let on_pill = ui.input(|i| i.pointer.hover_pos()).map(|pos| pill.contains(pos)).unwrap_or(false);
+    match st {
+        None => { p.text(pos2(xr, cy), Align2::RIGHT_CENTER, "download", font.clone(), if resp.hovered() { acc } else { DIM }); }
+        Some(DlState::Working) => { p.text(pos2(xr, cy), Align2::RIGHT_CENTER, "downloading…", font.clone(), acc); }
+        Some(DlState::Failed(_)) => { p.text(pos2(xr, cy), Align2::RIGHT_CENTER, "failed, click to retry", font.clone(), Color32::from_rgb(255, 105, 97)); }
+        Some(DlState::Done(_)) => {
+            p.text(pos2(pill.left() - 10.0, cy), Align2::RIGHT_CENTER, "saved", font.clone(), Color32::from_rgb(120, 220, 140));
+            p.rect_filled(pill, 10.0, tint(acc, if on_pill { 150 } else { 90 }));
+            p.text(pill.center(), Align2::CENTER_CENTER, "▶  play", font.clone(), WHITE);
+        }
+    }
+    let resp = match st {
+        Some(DlState::Failed(e)) => resp.on_hover_text(e.as_str()),
+        _ => resp,
+    };
+    if resp.clicked() {
+        let pos = resp.interact_pointer_pos();
+        return match st {
+            Some(DlState::Done(_)) => if pos.map(|p| pill.contains(p)).unwrap_or(false) { DlAct::Play } else { DlAct::None },
+            Some(DlState::Working) => DlAct::None,
+            _ => DlAct::Download,
+        };
+    }
+    DlAct::None
+}
+
 /// A thin vertical divider between button groups.
 fn sep(ui: &mut egui::Ui) {
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 14.0), Sense::hover());
@@ -488,7 +541,7 @@ impl App {
         };
         apply_backdrop(hwnd, &settings.window);
         App {
-            _hotkeys: hotkeys, media_ids, smtc, smtc_key: (None, 0), smtc_last: Instant::now(), hwnd,
+            _hotkeys: hotkeys, media_ids, smtc, smtc_key: (None, 0), smtc_last: Instant::now(), hwnd, downloads: vec![],
             bus, rx, player, tmpdir,
             lufs: Arc::new(Loudness::load(&home.join("loudness.json"))),
             taste: Taste::load(&home.join("taste.json")),
@@ -599,6 +652,21 @@ impl App {
             Msg::Flash(t, s) => self.flash(t, s),
             Msg::Saved(t) => self.taste.record_save(&t),
             Msg::Media(k) => self.media_action(k),
+            Msg::DlDone { id, result } => {
+                let mut title = String::new();
+                if let Some((t, st)) = self.downloads.iter_mut().find(|(t, _)| t.id == id) {
+                    title = t.title.clone();
+                    *st = match &result {
+                        Ok(p) => DlState::Done(p.clone()),
+                        Err(e) => DlState::Failed(e.clone()),
+                    };
+                }
+                match result {
+                    Ok(_) => self.flash(format!("Saved: {title}"), 3.0),
+                    Err(e) => self.flash(format!("Download failed: {e}"), 6.0),
+                }
+            }
+
         }
     }
 
@@ -627,7 +695,7 @@ impl App {
                 } else if st == PState::Ended && !self.finished {
                     self.finished = true;
                     self.log_listen(true);
-                    if self.autoplay || self.repeat == Repeat::One { self.advance(true); }
+                    if !self.settings.download_mode && (self.autoplay || self.repeat == Repeat::One) { self.advance(true); }
                 }
             }
         }
@@ -687,7 +755,7 @@ impl App {
         self.logged = false;
         self.autosaved = false;
         self.crossfaded = false;
-        if self.autoplay && self.index + 1 >= self.queue.len() {
+        if self.autoplay && !self.settings.download_mode && self.index + 1 >= self.queue.len() {
             self.request_mix(false); // build the next songs now so there is no gap
         }
         self.prefetch_next();
@@ -721,7 +789,7 @@ impl App {
     }
 
     fn next(&mut self) {
-        if !self.queue.is_empty() && !self.busy { self.advance(false); }
+        if !self.queue.is_empty() && !self.busy && !self.settings.download_mode { self.advance(false); }
     }
 
     fn prev(&mut self) {
@@ -1105,6 +1173,7 @@ impl App {
         }
         if q.is_empty() { return; }
         if self.offline() {
+            if self.settings.download_mode { return self.flash("You're offline", 4.0); }
             self.flash("Offline: searching your saved songs", 4.0);
             self.library_filter = q;
             return self.set_view(View::Library);
@@ -1166,6 +1235,28 @@ impl App {
         self.flash(if added > 0 { format!("Added {added} to {name}") } else if tracks.is_empty() { "Nothing to add".into() } else { format!("{what} is already in {name}") }, 3.0);
     }
 
+    fn set_download_mode(&mut self, on: bool) {
+        self.settings.download_mode = on;
+        self.settings.save();
+        self.view = View::Results;
+    }
+
+    /// Pressing a song in download mode: stop what is playing, then download and save it.
+    fn start_download(&mut self, t: Track) {
+        if let Some((_, st)) = self.downloads.iter().find(|(x, _)| x.id == t.id) {
+            if matches!(st, DlState::Working | DlState::Done(_)) { return; }
+        }
+        if self.has_track || self.busy { self.stop(); }
+        self.downloads.retain(|(x, _)| x.id != t.id);
+        self.downloads.push((t.clone(), DlState::Working));
+        let (bus, tmp, dir) = (self.bus.clone(), self.tmpdir.clone(), self.paths.save.clone());
+        std::thread::spawn(move || {
+            let result = ytm::fetch(&t, &tmp).and_then(|_| ytm::save_track(&t, &tmp, &dir).map(|(p, _)| p));
+            if result.is_ok() { bus.send(Msg::Saved(t.clone())); }
+            bus.send(Msg::DlDone { id: t.id.clone(), result });
+        });
+    }
+
     fn media_keys(&mut self) {
         while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
             if ev.state != HotKeyState::Pressed { continue; }
@@ -1216,6 +1307,10 @@ impl App {
             return;
         }
         if ctx.wants_keyboard_input() { return; }
+        if self.settings.download_mode {
+            if ctx.input(|i| i.key_pressed(Key::Space)) { self.toggle(); }
+            return;
+        }
         let all = [Key::Space, Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown, Key::N, Key::P, Key::L, Key::B,
                    Key::S, Key::R, Key::A, Key::Z, Key::Y, Key::C, Key::Slash, Key::Num1, Key::Num2, Key::Num3, Key::Num4,
                    Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
@@ -1261,6 +1356,10 @@ impl App {
     fn ui(&mut self, ctx: &egui::Context) {
         let acc = self.accent();
         let fill = self.glass();
+        if self.settings.download_mode {
+            self.ui_download(ctx, acc, fill);
+            return;
+        }
         egui::TopBottomPanel::top("search").frame(boxed(fill)).show(ctx, |ui| {
             self.search_bar(ui, acc);
             self.tab_bar(ui, acc);
@@ -1299,16 +1398,22 @@ impl App {
 
     fn search_bar(&mut self, ui: &mut egui::Ui, acc: Color32) {
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 270.0).max(100.0);
+            let w = (ui.available_width() - 330.0).max(100.0);
             let r = egui::Frame::none().fill(TRACK).rounding(10.0).inner_margin(egui::Margin::symmetric(10.0, 3.0)).show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.search).id(self.search_id).frame(false).desired_width(w)
                     .hint_text(RichText::new("Search songs    ( / to focus )").color(DIM)))
             }).inner;
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { self.do_search(); }
             if tbtn(ui, "[search]", WHITE, acc).clicked() { self.do_search(); }
-            if tbtn(ui, "[random]", WHITE, acc).clicked() { self.play_random(); }
             sep(ui);
-            if tbtn(ui, "[folder]", WHITE, acc).on_hover_text("open the saved songs folder").clicked() { self.open_saved_folder(); }
+            if self.settings.download_mode {
+                if tbtn(ui, "[exit download mode]", WHITE, acc).clicked() { self.set_download_mode(false); }
+            } else {
+                if tbtn(ui, "[random]", WHITE, acc).clicked() { self.play_random(); }
+                if tbtn(ui, "[folder]", WHITE, acc).on_hover_text("open the saved songs folder").clicked() { self.open_saved_folder(); }
+                sep(ui);
+                if tbtn(ui, "[download mode]", WHITE, acc).on_hover_text("search and download songs, nothing else").clicked() { self.set_download_mode(true); }
+            }
         });
     }
 
@@ -1452,6 +1557,7 @@ impl App {
                 RowAct::Right => { if let Some(t) = self.library.get(k).cloned() { self.queue_next(t) } }
                 _ => {}
             },
+
             _ => {
                 let start = self.queue_rows().0;
                 let qi = start + k;
@@ -1508,6 +1614,81 @@ impl App {
             }
         });
         if let Some(when) = seek { self.seek_to(when); }
+    }
+
+    fn ui_download(&mut self, ctx: &egui::Context, acc: Color32, fill: Color32) {
+        egui::TopBottomPanel::top("search").frame(boxed(fill)).show(ctx, |ui| self.search_bar(ui, acc));
+        egui::TopBottomPanel::bottom("player").frame(boxed(fill)).show(ctx, |ui| self.dl_strip(ui, acc));
+        egui::CentralPanel::default().frame(boxed(fill)).show(ctx, |ui| self.draw_downloads(ui, acc));
+    }
+
+    /// Search results; pressing a song downloads it, a [play] button appears once it is saved.
+    fn draw_downloads(&mut self, ui: &mut egui::Ui, acc: Color32) {
+        if self.results.is_empty() {
+            ui.label(RichText::new(format!("$ {}", self.list_msg)).color(WHITE));
+            note(ui, "# press a song to download it");
+            return;
+        }
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut act: Option<(usize, DlAct)> = None;
+        egui::ScrollArea::vertical().id_salt("downloads").auto_shrink([false; 2]).show_rows(ui, ROW, self.results.len(), |ui, range| {
+            for k in range {
+                let t = &self.results[k];
+                let st = self.downloads.iter().find(|(x, _)| x.id == t.id).map(|(_, s)| s);
+                let a = dl_row(ui, t, k, st, acc);
+                if a != DlAct::None { act = Some((k, a)); }
+            }
+        });
+        let Some((k, a)) = act else { return };
+        let t = self.results[k].clone();
+        match a {
+            DlAct::Download => self.start_download(t),
+            DlAct::Play => {
+                if let Some((_, DlState::Done(p))) = self.downloads.iter().find(|(x, _)| x.id == t.id).cloned() {
+                    self.play_single(Track { id: format!("local:{}", p.display()), thumb: String::new(), ..t });
+                }
+            }
+            DlAct::None => {}
+        }
+    }
+
+    /// What is downloading and what is playing, and nothing else.
+    fn dl_strip(&mut self, ui: &mut egui::Ui, acc: Color32) {
+        let working: Vec<Track> = self.downloads.iter().filter(|(_, s)| matches!(s, DlState::Working)).map(|(t, _)| t.clone()).collect();
+        let cur = self.current_track().cloned();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                match working.first() {
+                    Some(t) => {
+                        let more = if working.len() > 1 { format!("   (+{} more)", working.len() - 1) } else { String::new() };
+                        ui.label(RichText::new(format!("Downloading: {} - {}{}", ell(&t.title, 50), ell(&t.artist, 30), more)).color(acc));
+                    }
+                    None => { ui.label(RichText::new("Not downloading").color(DIM)); }
+                }
+                if Instant::now() < self.flash.1 {
+                    ui.label(RichText::new(ell(&self.flash.0, 90)).color(DIM));
+                } else if self.busy {
+                    ui.label(RichText::new(self.busy_text.clone()).color(DIM));
+                } else if let Some(t) = &cur {
+                    ui.label(RichText::new(format!("Playing: {} - {}", ell(&t.title, 50), ell(&t.artist, 30))).color(WHITE));
+                } else {
+                    ui.label(RichText::new("Nothing playing").color(DIM));
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if cur.is_some() && ibtn(ui, "⏹", acc, false).clicked() { self.stop(); }
+                if cur.is_some() {
+                    let playing = matches!(self.state, PState::Playing) || self.busy;
+                    if ibtn(ui, if playing { "⏸" } else { "▶" }, acc, true).clicked() { self.toggle(); }
+                }
+            });
+        });
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
+        let frac = if self.has_track && !self.busy && self.length > 0.0 { (self.pos / self.length).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, TRACK);
+        p.rect_filled(Rect::from_min_size(rect.min, vec2(rect.width() * frac, rect.height())), 2.0, acc);
     }
 
     fn draw_playlists(&mut self, ui: &mut egui::Ui, acc: Color32) {
